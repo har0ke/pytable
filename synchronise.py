@@ -3,22 +3,27 @@ from pytable.models import Image, ImageFlags, FilmRoll
 from datetime import datetime
 import peewee as pw
 import os
-import shutil
 from dataclasses import dataclass
 from typing import Tuple, Optional, Generic, TypeVar, Iterable
+from vmgr.actions import Trash
+import subprocess
+import shlex
 
 T = TypeVar('T')
-
 Range = Tuple[Optional[T], Optional[T]]
 
-class Filter:
 
+class Filter:
 
     def __call__(self, image: Image):
         return self.matches(image)
 
     def matches(self, image: Image) -> bool:
-        ...
+        return True
+
+    def __str__(self) -> str:
+        return 'All'
+
 
 @dataclass
 class LocalRegion(Filter):
@@ -41,6 +46,9 @@ class LocalRegion(Filter):
             return False
         return True
 
+    def __str__(self) -> str:
+        return f"LocalRange[({self.date_range[0] and self.date_range[0].strftime("%Y%m%d")}, {self.date_range[1] and self.date_range[1].strftime("%Y%m%d")}), ({self.stars_range[0]}, {self.stars_range[1]})]"
+
 @dataclass
 class Or(Filter):
 
@@ -48,6 +56,9 @@ class Or(Filter):
 
     def matches(self, image: Image) -> bool:
         return any(f(image) for f in self.filters)
+
+    def __str__(self) -> str:
+        return f"Or([\n\t{"\n\t".join((str(f) + ',' for f in self.filters))}\n])"
 
 @dataclass
 class And(Filter):
@@ -57,31 +68,18 @@ class And(Filter):
     def matches(self, image: Image) -> bool:
         return all(f(image) for f in self.filters)
 
+    def __str__(self) -> str:
+        return f"And([\n\t{"\n\t".join(('<' + str(f) + '>,' for f in self.filters))}\n])"
+
 
 class Config:
 
-    def __init__(self) -> None:
-        self.filter = Or([
-            LocalRegion((datetime(2024, 6, 14), None), (0, None)),
-            LocalRegion((datetime(2024, 6, 22, 14), datetime(2024, 6, 22, 14, 24)))
-        ])
+    def __init__(self, d_root: str | None = None, d_local: str | None=None, dry_run=False) -> None:
+        self.d_root = d_root or "/home/oke/Pictures/Darktable"
+        self.d_local = d_local or "/home/oke/Pictures/DarktableLocal"
+        self.dry_run = dry_run
 
-        self.d_root = "/home/oke/Pictures/Darktable"
-        self.d_local = "/home/oke/Pictures/DarktableLocal"
-        self.d_remote = "/home/oke/Pictures/DarktableRemote"
-
-
-    @staticmethod
-    def _is_older_than(image: Image, date: datetime):
-        return (image.datetime_taken or image.datetime_imported) < date
-
-    def should_not_be_local(self, image: Image):
-        return not self.filter(image)
-
-    def should_be_local(self, image: Image):
-        return self.filter(image)
-
-    def image_local_folder(self, image: Image):
+    def image_local_folder(self, image: Image) -> str:
         folder = image.film.folder
         if not folder.startswith(self.d_root):
             raise NotImplementedError()
@@ -137,8 +135,9 @@ class FileInfo:
 
 class SyncManager:
 
-    def __init__(self, config) -> None:
+    def __init__(self, config: Config, filter: Filter) -> None:
         self._config = config
+        self._filter = filter
         self._files: Dict[str, SyncReq] = {}
 
     def register_file(self, fn: str, requirement: SyncReq):
@@ -147,7 +146,7 @@ class SyncManager:
         self._files[fn] = requirement
 
     def register_image(self, image: Image):
-        required = self._config.should_be_local(image)
+        required = self._filter(image)
         self.register_file(
             self._config.image_local_image(image),
             SyncReq.make(required, False)
@@ -169,129 +168,106 @@ class SyncManager:
             result[req].append(file)
         return result
 
-config = Config()
-
-sync_manager = SyncManager(config)
-
-query = Image.filter()
-pw.prefetch(query, FilmRoll)
-for image in query:
-    sync_manager.register_image(image)
-
-
-actions = sync_manager.partition()
-
-for key in actions:
-    actions[key] = list(sorted(map(
-        lambda fn: os.path.relpath(fn, config.d_local) + "\n",
-        actions[key]
+def write_to(fn, file_list, realtive_to):
+    lines = list(sorted(map(
+        lambda fn: os.path.relpath(fn, realtive_to) + "\n",
+        file_list
     )))
+    with open(fn, "w") as f:
+        f.writelines(lines)
 
-with open("required.txt", "w") as f:
-    f.writelines(actions[SyncReq.REQUIRED])
-import subprocess
-user = "oke"
-host = "192.168.20.2"
+def synchronize_from_remote(config, required_files):
+    write_to("required.txt", required_files, config.d_local)
+    user = "oke"
+    host = "192.168.20.2"
+    args = [
+        "rsync",
+        "--info=progress",
+        "--ignore-existing",
+        "-av",
+        "--files-from",
+        "required.txt",
+        f"{user}@{host}:lenovo-darktable{config.d_local}",
+        os.path.abspath(config.d_local)
+    ]
+    if config.dry_run:
+        args.append('--dry-run')
+    print(shlex.join(args))
+    subprocess.call(args)
 
-args = [
-    "rsync",
-    # "--dry-run",
-    "--info=progress",
-    "--ignore-existing",
-    "-av",
-    "--files-from",
-    "required.txt",
-    f"{user}@{host}:lenovo-darktable{config.d_local}",
-    os.path.abspath(config.d_local)
-]
-import shlex
-print(shlex.join(args))
-subprocess.call(args)
+def remove_unnessecary(config: Config, to_remove):
+    remove_list_fn = "sync_remove.txt"
+    try:
 
-with open("required_optional.txt", "w") as f:
-    f.writelines(actions[SyncReq.REQUIRED_SOFT])
+        reply = input("There are %d files to remove. Want to see them [type: y]? " % len(to_remove))
+        if reply == 'y':
+            write_to(remove_list_fn, to_remove, config.d_local)
+            subprocess.call(['vim', '-R', remove_list_fn])
+        if not config.dry_run:
+            reply = input("There are %d files to remove. Want to DELETE them [type: YES]? " % len(to_remove))
+            if reply == 'YES':
+                for f in to_remove:
+                    Trash(f).run()
+    finally:
+        if os.path.exists(remove_list_fn):
+            os.remove(remove_list_fn)
 
-with open("remove.txt", "w") as f:
-    f.writelines(actions[SyncReq.EXISTS])
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action='store_true')
+    options, filter_args = parser.parse_known_args()
 
-exit()
-for fn in actions[SyncReq.REQUIRED_SOFT]:
-    if not os.path.exists(fn):
-        print("FETCH opt: ", fn)
+    filter = None
+    while filter_args:
+        if filter_args[0] != '--sync':
+            print(f"Unexpected arg {filter_args[0]}")
+            exit(1)
+        try:
+            next_sync = filter_args.index('--sync', 1)
+            args = filter_args[:next_sync]
+            filter_args = filter_args[next_sync:]
+        except ValueError:
+            args = filter_args
+            filter_args = []
 
-for fn in sync_manager.files_to_fetch_required():
-    print("FETCH: ", fn)
+        filter_parser = argparse.ArgumentParser()
+        filter_parser.add_argument("--from", dest='from_date', type=lambda s: datetime.strptime(s, '%Y%m%d'), default=None)
+        filter_parser.add_argument("--to", dest='to_date', type=lambda s: datetime.strptime(s, '%Y%m%d'), default=None)
+        filter_parser.add_argument("--min-stars", type=int, default=None)
+        filter_parser.add_argument("--max-stars", type=int, default=None)
 
-for fn in sync_manager.files_to_remove():
-    print("RM: ", fn)
-n_total = 0
-n_not_needed = 0
-needs_removal = []
-extra_files_to_remove = []
-bytes_to_remove = 0
+        filter_options = filter_parser.parse_args(args[1:])
+        parsed_filter = LocalRegion((filter_options.from_date, filter_options.to_date), (filter_options.min_stars, filter_options.max_stars))
+        if filter:
+            filter = Or([
+                filter,
+                parsed_filter
+            ])
+        else:
+            filter = parsed_filter
 
-needs_fetching = []
+    if not filter:
+        print("Nothing to be synchronized")
+        exit()
+    print(filter)
+    config = Config(dry_run=options.dry_run)
 
-for file, usages in file_usages.items():
-    if not file.startswith(d_root):
-        print("SKIPPNG", file)
-        continue
-    assert file.startswith(d_root)
-    remote_file = file.replace(d_root, d_remote)
-    local_file = file.replace(d_root, d_local)
+    sync_manager = SyncManager(config, filter)
 
-    if usages > 0:
-        if not os.path.exists(local_file):
-            needs_fetching.append((remote_file, local_file))
-    else:
-        n_not_needed += 1
-        if os.path.exists(local_file):
-            needs_removal.append(local_file)
-            bytes_to_remove += os.stat(local_file).st_size
+    query = Image.filter()
+    pw.prefetch(query, FilmRoll)
+    for image in query:
+        sync_manager.register_image(image)
 
-        for extra_fn in potential_extras(local_file):
-            if os.path.exists(extra_fn):
-                extra_files_to_remove.append(extra_fn)
-                bytes_to_remove += os.stat(extra_fn).st_size
 
-files_to_remove = list(sorted(needs_removal + extra_files_to_remove))
+    actions = sync_manager.partition()
 
-needs_fetching = sorted(needs_fetching)
-import pprint
-print("Files to fetch: ")
-pprint.pprint(needs_fetching)
-print("Extra files to remove:")
-pprint.pprint(extra_files_to_remove)
-print("First files to remove:")
-pprint.pprint(needs_removal[:10])
-print("Last files to remove:")
-pprint.pprint(needs_removal[-10:])
+    required_files = actions[SyncReq.REQUIRED]
+    synchronize_from_remote(config, required_files)
 
-with open("remove.txt", "w") as f:
-    pprint.pprint(sorted(set(needs_removal).union(extra_files_to_remove)), f)
+    to_remove = [l for l in actions[SyncReq.EXISTS] if os.path.exists(l)]
+    remove_unnessecary(config, to_remove)
 
-print("Not needed:            %6d / %6d (%3d%%)" % (n_not_needed, len(file_usages), 100 * n_not_needed / len(file_usages)))
-print()
-print("Not yet deleted:       %6d / %6d (%3d%%)" % (len(needs_removal), n_not_needed, 100 * len(needs_removal) / n_not_needed))
-print("Bytes to free:         %5.2fGB" % (bytes_to_remove / 1024. / 1024 / 1024))
-print("Total files to remove: %d" % len(files_to_remove))
-print()
-print("Total files to fetch: %3d" % len(needs_fetching))
-print()
-
-reply = input("Type YES to remove all these files. This is not reversible... : ")
-
-if reply == 'YES':
-
-    for fn in files_to_remove:
-        assert fn.startswith(d_local)
-        os.remove(fn)
-
-    for f, t in needs_fetching:
-        assert os.path.exists(f), "Backup corruped, file not found: " + f
-        assert not os.path.exists(t)
-        print(f, t)
-        shutil.copy(f, t)
-
-else:
-    print("You did not type 'YES'. Not doing anything!")
+if __name__ == "__main__":
+    main()

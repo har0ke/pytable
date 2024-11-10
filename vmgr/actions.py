@@ -116,8 +116,9 @@ class Trash(UndoableAction[str]):
     def __str__(self) -> str:
         return f"Trashing {self.args}"
 
-    def run(self, model: VideoModel):
+    def run(self, model: VideoModel = None):
         file = os.path.abspath(os.path.expanduser(self.args))
+        assert os.path.exists(file)
         i = 0
         suffix = ""
         while True:
@@ -141,9 +142,10 @@ class Trash(UndoableAction[str]):
                 suffix = f"_{i}"
                 continue
             os.rename(file, trash_fn)
-            index, video = model.find_video(Video(self.args))
-            if index:
-                model.remove(index)
+            if model:
+                index, video = model.find_video(Video(self.args))
+                if index:
+                    model.remove(index)
             break
 
 class SetVideoStars(UndoableAction[Tuple[str, bool, int, bool, int]]):
